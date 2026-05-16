@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+env/
+
+# Data folders (not needed on Streamlit Cloud)
+output/
+invoice_pdfs/
+input_pdfs/
+testing/
+
+# Debug/test files
+*.pdf
+*.xlsx
+*.txt
+*.bak
+debug_*.py
+debug_*.txt
+patch*.py
+inject_parsers.py
+refactor*.py
+scratch_*.py
+dummy_parsers.py
+fix_bugs.py
+analyze_output.py
+diagnose_all.py
+final_check.py
+match_report.py
+scan_formats.py
+test_*.py
+run_test*.py
+run_tests.bat
+test_format.bat
+quick_test.py
