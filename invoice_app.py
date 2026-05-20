@@ -25,6 +25,38 @@ def clean(x):
     return str(x).replace("\n", " ").strip()
 
 
+def _normalize_date(date_str):
+    """Normalize various date formats to DD-MM-YYYY."""
+    from datetime import datetime
+    if not date_str or not date_str.strip():
+        return date_str
+    date_str = date_str.strip()
+    formats = [
+        "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+        "%d-%b-%Y", "%d-%b-%y", "%d/%m/%y",
+        "%d.%m.%y",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+    return date_str
+
+
+def _dedup_brand(brand):
+    """Remove duplicated words in brand name, e.g. 'TETLEY TETLEY' -> 'TETLEY'."""
+    if not brand:
+        return brand
+    words = brand.strip().split()
+    if len(words) >= 2:
+        mid = len(words) // 2
+        if words[:mid] == words[mid:2*mid]:
+            return " ".join(words[:mid])
+    return brand
+
+
 def fix_zee_text(text):
     """Collapse spaced-out text caused by PDF font rendering.
     Handles: 'H I N D I' -> 'HINDI', 'H I NDI' -> 'HINDI', 
@@ -244,11 +276,11 @@ def extract_star_header(full_text):
     header["PO Number"] = ""
     for i, line in enumerate(lines):
         if "PO Number" in line:
-            # PO value might be on same line after "PO Number"
-            po = re.search(r'PO\s+Number\s+(\S+)', line)
-            if po:
-                po_val = clean(po.group(1))
-                # Check if next line has continuation (trailing fragment like "00")
+            # First try to find a proper PO pattern (contains / and digits)
+            po_pattern = re.search(r'([A-Z]*\d{2,}/\w+/\d+/?(?:\d+)?)', line)
+            if po_pattern:
+                po_val = clean(po_pattern.group(1))
+                # Check next line for trailing fragment
                 if i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
                     parts = next_line.split()
@@ -256,21 +288,44 @@ def extract_star_header(full_text):
                         po_val = po_val + parts[-1]
                 header["PO Number"] = po_val
             else:
-                # PO Number is just a label, value is at end of NEXT line
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    # Take the last whitespace-separated token(s) that look like a PO
-                    # e.g. "BANGALORE, KARNATAKA, 560001 01/11/2023- 15/11/2023 NOV2023/TVBRO/04754/"
-                    po2 = re.search(r'(\w+\d{4}/\w+/\d+/?(?:\d+)?)\s*$', next_line)
-                    if po2:
-                        po_val = clean(po2.group(1))
-                        # Check if next line has trailing fragment (e.g. "INDIA INDIA 00")
-                        if i + 2 < len(lines):
-                            next2 = lines[i + 2].strip()
-                            parts = next2.split()
+                # PO value might be on same line after "PO Number" - validate it
+                po = re.search(r'PO\s+Number\s+(\S+)', line)
+                if po:
+                    po_val = clean(po.group(1))
+                    # Validate: PO should contain '/' or be mostly digits, not random text
+                    if '/' in po_val or re.search(r'\d{4,}', po_val):
+                        if i + 1 < len(lines):
+                            next_line = lines[i + 1].strip()
+                            parts = next_line.split()
                             if parts and len(parts[-1]) <= 3 and parts[-1].isalnum():
                                 po_val = po_val + parts[-1]
                         header["PO Number"] = po_val
+                    else:
+                        # Invalid PO - search next lines for proper PO pattern
+                        for j in range(i + 1, min(i + 4, len(lines))):
+                            po2 = re.search(r'([A-Z]*\d{2,}/\w+/\d+/?(?:\d+)?)', lines[j])
+                            if po2:
+                                po_val = clean(po2.group(1))
+                                if j + 1 < len(lines):
+                                    next2 = lines[j + 1].strip()
+                                    parts = next2.split()
+                                    if parts and len(parts[-1]) <= 3 and parts[-1].isalnum():
+                                        po_val = po_val + parts[-1]
+                                header["PO Number"] = po_val
+                                break
+                else:
+                    # PO Number is just a label, value is at end of NEXT line
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        po2 = re.search(r'(\w+\d{4}/\w+/\d+/?(?:\d+)?)\s*$', next_line)
+                        if po2:
+                            po_val = clean(po2.group(1))
+                            if i + 2 < len(lines):
+                                next2 = lines[i + 2].strip()
+                                parts = next2.split()
+                                if parts and len(parts[-1]) <= 3 and parts[-1].isalnum():
+                                    po_val = po_val + parts[-1]
+                            header["PO Number"] = po_val
             break
 
     return header
@@ -898,7 +953,18 @@ def extract_sony_rows(full_text):
         if not re.search(r'\d{2}/\d{2}', stripped) and not re.search(r'^LEAF$', stripped):
             if re.search(r'[A-Z]{3,}', stripped):
                 current_caption = stripped
-    
+
+    # Fix truncated dates: "23/10" -> "23/10/2023" using year from invoice date
+    year_guess = ""
+    yr_m = re.search(r'(\d{4})', full_text[:500])  # year from top of document
+    if yr_m:
+        year_guess = yr_m.group(1)
+    if year_guess:
+        for r in rows:
+            d = r.get("Date", "")
+            if d and re.match(r'^\d{2}/\d{2}$', d):
+                r["Date"] = d + "/" + year_guess
+
     return rows
 
 # ==========================================
@@ -1093,8 +1159,20 @@ def extract_b4u_header(full_text):
     billed_match = re.search(r'BILLED TO\s+ADVERTISER:.*?\n(.*?)\n', full_text, re.IGNORECASE)
     if billed_match:
         names = billed_match.group(1)
+        # Check if advertiser name continues on next lines (e.g. "TATA CONSUMER" + "PRODUCTS LIMITED")
+        match_end = billed_match.end()
+        remaining_lines = full_text[match_end:].split('\n')
+        for cont in remaining_lines[:3]:  # check up to 3 continuation lines
+            cont = cont.strip()
+            if cont and re.match(r'^(PRODUCTS|LIMITED|LTD|PRIVATE|PVT|INDIA|CONSUMER)', cont, re.IGNORECASE):
+                if "Invoice" not in cont and "Channel" not in cont:
+                    names = names.rstrip() + " " + cont
+            else:
+                break
         if " Invoice Number" in names:
             names = names.split(" Invoice Number")[0]
+        if " Invoice" in names:
+            names = names.split(" Invoice")[0]
         if " - " in names:
             parts = names.split(" - ", 1)
             header["Agency Name"] = clean(parts[0])
@@ -1208,8 +1286,20 @@ def extract_jaya_header(full_text):
     header["Channel Name"] = clean(chan.group(1)) if chan else ""
 
     brand = re.search(r'Brand\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
-    header["Brand"] = clean(brand.group(1)) if brand else ""
-    header["Billing Period"] = ""
+    brand_val = clean(brand.group(1)) if brand else ""
+    # Strip "Place Of Supply :... Deal Ref No :..." contamination
+    brand_val = re.sub(r'\s+Place\s+Of\s+Supply.*$', '', brand_val, flags=re.IGNORECASE).strip()
+    brand_val = re.sub(r'\s+Deal\s+Ref.*$', '', brand_val, flags=re.IGNORECASE).strip()
+    header["Brand"] = brand_val
+
+    # PO / Deal Ref No for J Movies
+    if not header.get("PO Number"):
+        deal = re.search(r'Deal\s+Ref\s+No\s*:?\s*([A-Z0-9/\-]+)', full_text, re.IGNORECASE)
+        header["PO Number"] = clean(deal.group(1)) if deal else ""
+
+    # Billing Period
+    bp = re.search(r'(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})\s*(?:to|[-–])\s*(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})', full_text, re.IGNORECASE)
+    header["Billing Period"] = f"{bp.group(1)} to {bp.group(2)}" if bp else ""
     header["Station Relation"] = ""
     return header
 
@@ -1420,7 +1510,21 @@ def extract_raj_header(full_text):
     adv = re.search(r'ADVERTISER\s*\n\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
     if not adv:
         adv = re.search(r'Advertiser\s*:?\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
-    header["Advertiser Name"] = clean(adv.group(1)) if adv else ""
+    adv_name = clean(adv.group(1)) if adv else ""
+    # Skip if parser picked up "Activity Period" text instead of advertiser
+    if adv_name and re.search(r'Activity\s+Period', adv_name, re.IGNORECASE):
+        # Try alternate extraction: look for client/advertiser name in invoice
+        adv2 = re.search(r'Client\s*:?\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
+        if adv2:
+            adv_name = clean(adv2.group(1))
+        else:
+            # Try to find name near "M/s" pattern
+            adv3 = re.search(r'M/s\.?\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
+            if adv3:
+                adv_name = clean(adv3.group(1))
+            else:
+                adv_name = ""
+    header["Advertiser Name"] = adv_name
     # Channel
     chan = re.search(r'CHANNEL\s+(.*?)(?:\n|$)', full_text, re.IGNORECASE)
     if not chan:
@@ -1528,8 +1632,26 @@ def extract_vendhar_header(full_text):
     chan = re.search(r'Channel\s*(?:Name)?\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
     header["Channel Name"] = clean(chan.group(1)) if chan else ""
     brand = re.search(r'Brand\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
-    header["Brand"] = clean(brand.group(1)) if brand else ""
-    header["Billing Period"] = ""
+    brand_val = clean(brand.group(1)) if brand else ""
+    # Strip "Telecast Certificate" suffix from brand
+    brand_val = re.sub(r'\s+Telecast\s+Certificate.*$', '', brand_val, flags=re.IGNORECASE).strip()
+    header["Brand"] = brand_val
+
+    # Try broader Invoice Number patterns for SRN format
+    if not header.get("Invoice Number"):
+        inv2 = re.search(r'(?:Invoice|Inv)[\s#]*(?:No|Number|Num)[\s.:]*([A-Z0-9][A-Z0-9/\-]+)', full_text, re.IGNORECASE)
+        header["Invoice Number"] = clean(inv2.group(1)) if inv2 else ""
+
+    # Try broader PO/RO patterns for SRN format
+    if not header.get("PO Number"):
+        ro2 = re.search(r'(?:RO|R\.O\.|PO|P\.O\.)\s*(?:No|Number|Num|#)?[\s.:]*([A-Z0-9][A-Z0-9/\-]+)', full_text, re.IGNORECASE)
+        header["PO Number"] = clean(ro2.group(1)) if ro2 else ""
+
+    # Billing Period for Vendhar: "01-Aug-2023-31-Aug-2023" or similar
+    if not header.get("Billing Period"):
+        bp = re.search(r'(\d{2}[/\-\.][A-Za-z0-9]+[/\-\.]\d{4})\s*(?:to|[-–])\s*(\d{2}[/\-\.][A-Za-z0-9]+[/\-\.]\d{4})', full_text, re.IGNORECASE)
+        header["Billing Period"] = f"{bp.group(1)} to {bp.group(2)}" if bp else ""
+
     header["Station Relation"] = ""
     return header
 
@@ -1582,7 +1704,10 @@ def extract_vanitha_header(full_text):
     agency = re.search(r'Agency\s*(?:Name)?\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
     header["Agency Name"] = clean(agency.group(1)) if agency else ""
     adv = re.search(r'(?:Advertiser|Client)\s*(?:Name)?\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
-    header["Advertiser Name"] = clean(adv.group(1)) if adv else ""
+    adv_name = clean(adv.group(1)) if adv else ""
+    # Strip GSTIN appended to name e.g. "Tata Consumer Products Limited GSTIN : 36AADCR..."
+    adv_name = re.sub(r'\s+GSTIN\s*:.*$', '', adv_name, flags=re.IGNORECASE).strip()
+    header["Advertiser Name"] = adv_name
     chan = re.search(r'Channel\s*(?:Name)?\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
     header["Channel Name"] = clean(chan.group(1)) if chan else ""
     brand = re.search(r'Brand\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
@@ -1670,9 +1795,147 @@ def extract_vanitha_rows(full_text):
     return rows
 
 # ==========================================
+# MATRIX PUBLICITIES PARSER
+# ==========================================
+def extract_matrix_header(full_text):
+    header = {"Broadcaster Name": "MATRIX PUBLICITIES AND MEDIA INDIA PVT. LTD."}
+    lines = full_text.split('\n')
+
+    # Invoice Number: look for "MPIPL/..." pattern
+    inv = re.search(r'(MPIPL/[A-Z0-9/\-]+)', full_text)
+    if not inv:
+        inv = re.search(r'Invoice\s*(?:No|Number)\.?\s*:?\s*([A-Z0-9][A-Z0-9/\-]+)', full_text, re.IGNORECASE)
+    header["Invoice Number"] = clean(inv.group(1)) if inv else ""
+
+    inv_date = re.search(r'Invoice\s*Date\s*:?\s*(\d{2}[/\-\.]\d{2}[/\-\.]\d{4}|\d{2}-[A-Za-z]{3}-\d{4})', full_text, re.IGNORECASE)
+    header["Invoice Date"] = clean(inv_date.group(1)) if inv_date else ""
+
+    # PO Number: look for "JUN2023/TVBRO/..." or "DEC2023/TVBRO/..." patterns
+    po = re.search(r'([A-Z]{3}\d{4}/[A-Z]+/\d+(?:/\d+)?)', full_text)
+    if not po:
+        po = re.search(r'(?:PO|RO)\s*(?:No|Number|#)?\s*:?\s*([A-Z0-9][A-Z0-9/\-]+)', full_text, re.IGNORECASE)
+    header["PO Number"] = clean(po.group(1)) if po else ""
+
+    # Agency: look for "GROUP M" or "GROUPM"
+    agency = re.search(r'(GROUP\s*M\s+MEDIA\s+INDIA\s+(?:PVT\.?\s+)?(?:LTD\.?|LIMITED))', full_text, re.IGNORECASE)
+    if not agency:
+        agency = re.search(r'(?:Agency|To\s*:?\s*M/s\.?)\s*:?\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
+    header["Agency Name"] = clean(agency.group(1)) if agency else "GROUP M MEDIA INDIA PVT. LTD."
+
+    # Advertiser: "Advertiser Name :" or "Client :" — NOT "PO Number :"
+    adv = re.search(r'(?:Advertiser|Client)\s*(?:Name)?\s*:?\s*(TATA[^\n]+|[A-Z][A-Z\s]+(?:LIMITED|LTD))', full_text, re.IGNORECASE)
+    if not adv:
+        adv = re.search(r'(?:Advertiser|Client)\s*(?:Name)?\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
+    adv_name = clean(adv.group(1)) if adv else ""
+    # Reject if it captured label text
+    if re.search(r'^(PO\s+Number|Invoice|Agency|Brand|Name\s*:)', adv_name, re.IGNORECASE):
+        adv_name = ""
+    header["Advertiser Name"] = adv_name
+
+    # Brand: "Brand Name : TATA TEA AGNI" — strip "Name : " prefix
+    brand = re.search(r'Brand\s*(?:Name)?\s*:\s*(.*?)(?:\n|$)', full_text, re.IGNORECASE)
+    brand_val = clean(brand.group(1)) if brand else ""
+    # Remove "Name :" prefix if captured
+    brand_val = re.sub(r'^Name\s*:\s*', '', brand_val, flags=re.IGNORECASE).strip()
+    header["Brand"] = brand_val
+
+    # Channel: NOT "wise No. of Spots" — look for actual channel names
+    chan = ""
+    channel_patterns = [
+        r'(ZEE\s+\w+|SONY\s+\w+|STAR\s+\w+|SUN\s+\w+|COLORS\s+\w*|ZEE\s+TV|&\s*TV)',
+        r'Channel\s*(?:Name)?\s*:\s*((?!wise).*?)(?:\n|$)',
+    ]
+    for cp in channel_patterns:
+        cm = re.search(cp, full_text, re.IGNORECASE)
+        if cm:
+            candidate = clean(cm.group(1))
+            if "wise" not in candidate.lower() and len(candidate) > 2:
+                chan = candidate
+                break
+    header["Channel Name"] = chan
+
+    header["Billing Period"] = ""
+    bp = re.search(r'(?:Billing|Activity|Invoice)\s*Period\s*:?\s*(\d{2}[/\-]\d{2}[/\-]\d{4})\s*(?:to|[-–])\s*(\d{2}[/\-]\d{2}[/\-]\d{4})', full_text, re.IGNORECASE)
+    if bp:
+        header["Billing Period"] = f"{bp.group(1)} to {bp.group(2)}"
+
+    header["Station Relation"] = ""
+    return header
+
+
+def extract_matrix_rows(full_text):
+    """
+    Matrix invoice format: summary table with Channel, spots, dates.
+    Lines like: 'ZEE PUNJABI 17-Nov-2023 30 1 30 500 15000'
+    or:          'SONY SAB 18-Nov-2023 20 2 40 800 32000'
+    """
+    rows = []
+    lines = full_text.split('\n')
+
+    # Find table header
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if re.search(r'Channel|wise\s+No|Spots|Date', line, re.IGNORECASE) and \
+           re.search(r'(Amount|Rate|Spots|Duration)', line, re.IGNORECASE):
+            start_idx = i + 1
+            break
+
+    SKIP_RE = re.compile(r'(Total|Grand|Taxable|CGST|SGST|Net\s+Amount|RUPEE|IRN|'
+                         r'Invoice|Agency|Advertiser|Brand|PO\s+Number|Channel\s+wise|'
+                         r'MATRIX\s+PUBLICITIES|Page\s+\d|Authorized|wise\s+No)', re.IGNORECASE)
+
+    DF = r'(?:\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4}|\d{2}[- ][A-Za-z]{3}[- ]\d{4})'
+    AMT = r'[\d,]+(?:\.\d{1,2})?'
+
+    for line in lines[start_idx:]:
+        stripped = line.strip()
+        if not stripped or SKIP_RE.search(stripped):
+            continue
+
+        # Pattern: ChannelName Date Duration Spots TotalSec Rate Amount
+        # e.g. "ZEE PUNJABI 17-Nov-2023 30 1 30 500 15000"
+        m = re.search(
+            r'^([A-Z][A-Z\s&]+?)\s+(' + DF + r')\s+(\d+)\s+(\d+)\s+(\d+)\s+(' + AMT + r')\s+(' + AMT + r')\s*$',
+            stripped
+        )
+        if m:
+            channel = m.group(1).strip()
+            rows.append({
+                "Date": m.group(2),
+                "Air Time": "",
+                "Program": "",
+                "Spot Copy": "",
+                "LEN": m.group(3),
+                "Rate (INR)": m.group(6),
+                "Channel_Override": channel,
+            })
+            continue
+
+        # Pattern without spots count: ChannelName Date Duration Rate Amount
+        m2 = re.search(
+            r'^([A-Z][A-Z\s&]+?)\s+(' + DF + r')\s+(\d+)\s+(' + AMT + r')\s+(' + AMT + r')\s*$',
+            stripped
+        )
+        if m2:
+            channel = m2.group(1).strip()
+            rows.append({
+                "Date": m2.group(2),
+                "Air Time": "",
+                "Program": "",
+                "Spot Copy": "",
+                "LEN": m2.group(3),
+                "Rate (INR)": m2.group(4),
+                "Channel_Override": channel,
+            })
+            continue
+
+    return rows
+
+
+# ==========================================
 # GENERIC / FALLBACK PARSER
 # (Works for Goldmines, News Nation, Enter10,
-#  Shemaroo, Matrix, Vasanth, and similar)
+#  Shemaroo, Vasanth, and similar)
 # ==========================================
 def extract_generic_header(full_text, format_name="Unknown"):
     header = {}
@@ -1962,7 +2225,8 @@ def extract_vasanth_rows(full_text):
         return rows
 
     SKIP_RE = re.compile(r'(Total|Grand|VASANTH|No\.27|Phone|GSTIN|PAN|Railway|Kavery|Saidapet|'
-                          r'Chennai|Authorised|Payment|HSN|INVOICE|DATE:|accounts@)', re.IGNORECASE)
+                          r'Chennai|Authorised|Payment|HSN|INVOICE|DATE:|accounts@|'
+                          r'M/s\.|GROUPM|WAVEMAKER|VTV/|DANCERS|SHIK)', re.IGNORECASE)
 
     # Pattern: mm/dd/yyyy HH:MM:SS AM/PM HH:MM:SS AM/PM Rate LEN Amount BRAND
     # Example: '11/01/2023 08:06:13 AM 08:06:33 AM 80.00 20 160.00 TATA CHAKRA GOLD'
@@ -1985,8 +2249,15 @@ def extract_vasanth_rows(full_text):
         m = PAT.search(stripped)
         if m:
             brand = m.group(9).strip()
+            # Fix MM/DD/YYYY -> DD/MM/YYYY (Vasanth stores dates in American format)
+            raw_date = m.group(1)
+            date_parts = raw_date.split('/')
+            if len(date_parts) == 3:
+                fixed_date = f"{date_parts[1]}/{date_parts[0]}/{date_parts[2]}"
+            else:
+                fixed_date = raw_date
             rows.append({
-                "Date": m.group(1),
+                "Date": fixed_date,
                 "Air Time": f"{m.group(2)} {m.group(3)}",
                 "Rate (INR)": m.group(6),
                 "LEN": m.group(7),
@@ -2394,7 +2665,7 @@ def process_pdf_stream(pdf_stream, filename="Uploaded PDF"):
         format_detected = "Enter10"
     elif re.search(r'Shemaroo|SHEMAROO', ft):
         format_detected = "Shemaroo"
-    elif re.search(r'Matrix\s+Broadcast|MATRIX\s+BROADCAST|Matrix\s+Media|MATRIX\s+MEDIA', ft):
+    elif re.search(r'Matrix\s+(?:Broadcast|Media|Publicities)|MATRIX\s+(?:BROADCAST|MEDIA|PUBLICITIES)', ft, re.IGNORECASE):
         format_detected = "Matrix"
     elif re.search(r'Vasanth|VASANTH', ft):
         format_detected = "Vasanth"
@@ -2451,8 +2722,11 @@ def process_pdf_stream(pdf_stream, filename="Uploaded PDF"):
     elif format_detected == "News Nation":
         header = extract_newsnation_header(full_text)
         broadcast_rows = extract_newsnation_rows(full_text)
+    elif format_detected == "Matrix":
+        header = extract_matrix_header(full_text)
+        broadcast_rows = extract_matrix_rows(full_text)
     else:
-        # Generic parser for Matrix and any unknown formats
+        # Generic parser for any unknown formats
         header = extract_generic_header(full_text, format_detected)
         broadcast_rows = extract_generic_rows(full_text)
 
@@ -2474,7 +2748,13 @@ def process_pdf_stream(pdf_stream, filename="Uploaded PDF"):
 
     # Combine header + each broadcast row
     for brow in broadcast_rows:
-        
+
+        # Skip garbage rows — Date must look like a real date
+        raw_date = brow.get("Date", "")
+        if raw_date and len(raw_date) > 30:
+            # Date field too long — garbage (e.g. Vasanth address block)
+            continue
+
         # Calculate new column: (INR Rate * Duration) / 10
         calculated_amount = ""
         try:
@@ -2491,27 +2771,40 @@ def process_pdf_stream(pdf_stream, filename="Uploaded PDF"):
         if not brand and header.get("Brand"):
             brand = header.get("Brand")
 
+        # De-duplicate brand (e.g. "TETLEY TETLEY" -> "TETLEY")
+        brand = _dedup_brand(brand)
+
+        # Normalize date to DD-MM-YYYY
+        normalized_date = _normalize_date(raw_date) if raw_date else ""
+
         # Auto-derive Day from Date if missing
         day_val = brow.get("Day", "")
         if not day_val:
-            day_val = _derive_day_from_date(brow.get("Date", ""))
+            day_val = _derive_day_from_date(normalized_date or raw_date)
+
+        # Channel: allow per-row override (Matrix has channel per row)
+        channel_name = brow.get("Channel_Override", "") or header.get("Channel Name", "")
+
+        # Clean Star India Spot Copy — strip leading date prefix like "(18/04/2023) ..."
+        spot_copy = brow.get("Spot Copy", "")
+        spot_copy = re.sub(r'^\(\d{2}/\d{2}/\d{4}\)\s*', '', spot_copy).strip()
 
         row = {
             "Broadcaster Name": header.get("Broadcaster Name", ""),
             "Agency Name": header.get("Agency Name", ""),
             "Advertiser Name": header.get("Advertiser Name", ""),
-            "Channel Name": header.get("Channel Name", ""),
+            "Channel Name": channel_name,
             "Billing Period": header.get("Billing Period", ""),
             "PO Number": header.get("PO Number", ""),
             "Invoice Number": header.get("Invoice Number", ""),
             "Invoice Date": header.get("Invoice Date", ""),
             "TP": brow.get("TP", ""),
             "Program": brow.get("Program", ""),
-            "Date": brow.get("Date", ""),
+            "Date": normalized_date if normalized_date else raw_date,
             "Day": day_val,
             "Air Time": brow.get("Air Time", ""),
             "LEN (Duration Sec)": brow.get("LEN", ""),
-            "Spot Copy (Caption)": brow.get("Spot Copy", ""),
+            "Spot Copy (Caption)": spot_copy,
             "Brand": brand,
             "Rate (INR)": brow.get("Rate (INR)", ""),
             "Calculated Amount (INR)": calculated_amount,
